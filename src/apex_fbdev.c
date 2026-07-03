@@ -42,6 +42,27 @@
 #define FBIO_WAITFORVSYNC _IOW('F', 0x20, __u32)
 #endif
 
+/*
+ * Userspace-settable coherent-buffer layout. The kernel does not know where a
+ * given model places its input/output activations; libedgetpu supplies these
+ * at model-load time. Offsets/lengths are relative to the coherent buffer.
+ *
+ *  - in_offset  : where the fb's input image is copied to (fb -> coherent)
+ *  - out_offset : where the result is read from          (coherent -> fb)
+ *
+ * The default (see apex_fbdev_init) splits the coherent buffer in half so the
+ * input and output regions never overlap even before userspace configures it.
+ */
+struct apex_fb_layout {
+	__u32 in_offset;
+	__u32 in_len;
+	__u32 out_offset;
+	__u32 out_len;
+};
+
+#define APEX_FBIO_SET_LAYOUT _IOW('F', 0x40, struct apex_fb_layout)
+#define APEX_FBIO_GET_LAYOUT _IOR('F', 0x41, struct apex_fb_layout)
+
 struct apex_fbdev {
 	struct gasket_dev *gasket_dev;
 	struct fb_info *info;
@@ -52,6 +73,16 @@ struct apex_fbdev {
 	void *mem;
 	size_t mem_size;
 
+	/*
+	 * Separate input/output windows within the coherent buffer.
+	 * Set to sane non-overlapping defaults at init; overridable via
+	 * APEX_FBIO_SET_LAYOUT.
+	 */
+	u32 in_offset;
+	u32 in_len;
+	u32 out_offset;
+	u32 out_len;
+
 	/* Completion sequencing for the repurposed vsync-wait. */
 	wait_queue_head_t wait;
 	u32 result_seq;
@@ -60,7 +91,8 @@ struct apex_fbdev {
 };
 
 /* ---------------------------------------------------------------------------
- * Result path: coherent -> fb, on the completion interrupt (hard IRQ).
+ * Result path: coherent[out_offset] -> fb, on the completion interrupt.
+ * Runs in hard-IRQ context; bounded copy only.
  * ------------------------------------------------------------------------- */
 static void apex_fbdev_done_cb(void *cb_data, int interrupt_index)
 {
@@ -74,11 +106,16 @@ static void apex_fbdev_done_cb(void *cb_data, int interrupt_index)
 
 	spin_lock_irqsave(&af->lock, flags);
 	coh = &af->gasket_dev->coherent_buffer;
-	copy_len = af->mem_size;
-	if (coh->length_bytes && copy_len > coh->length_bytes)
-		copy_len = coh->length_bytes;
-	if (af->mem && coh->virt_base && copy_len)
-		memcpy_fromio(af->mem, coh->virt_base, copy_len);
+
+	/* Clamp the copy to both the fb size and the coherent region. */
+	copy_len = min_t(size_t, af->out_len, af->mem_size);
+	if (coh->length_bytes && af->out_offset < coh->length_bytes) {
+		copy_len = min_t(size_t, copy_len,
+				 coh->length_bytes - af->out_offset);
+		if (af->mem && coh->virt_base && copy_len)
+			memcpy_fromio(af->mem,
+				      coh->virt_base + af->out_offset, copy_len);
+	}
 	af->result_seq++;
 	spin_unlock_irqrestore(&af->lock, flags);
 
@@ -86,7 +123,7 @@ static void apex_fbdev_done_cb(void *cb_data, int interrupt_index)
 }
 
 /* ---------------------------------------------------------------------------
- * Input path: fb -> coherent. Triggered explicitly by userspace.
+ * Input path: fb -> coherent[in_offset]. Triggered explicitly by userspace.
  * ------------------------------------------------------------------------- */
 static void apex_fbdev_push_input(struct apex_fbdev *af)
 {
@@ -96,11 +133,15 @@ static void apex_fbdev_push_input(struct apex_fbdev *af)
 
 	spin_lock_irqsave(&af->lock, flags);
 	coh = &af->gasket_dev->coherent_buffer;
-	copy_len = af->mem_size;
-	if (coh->length_bytes && copy_len > coh->length_bytes)
-		copy_len = coh->length_bytes;
-	if (af->mem && coh->virt_base && copy_len)
-		memcpy_toio(coh->virt_base, af->mem, copy_len);
+
+	copy_len = min_t(size_t, af->in_len, af->mem_size);
+	if (coh->length_bytes && af->in_offset < coh->length_bytes) {
+		copy_len = min_t(size_t, copy_len,
+				 coh->length_bytes - af->in_offset);
+		if (af->mem && coh->virt_base && copy_len)
+			memcpy_toio(coh->virt_base + af->in_offset,
+				    af->mem, copy_len);
+	}
 	spin_unlock_irqrestore(&af->lock, flags);
 }
 
@@ -204,19 +245,56 @@ static int apex_fb_ioctl(struct fb_info *info, unsigned int cmd,
 			 unsigned long arg)
 {
 	struct apex_fbdev *af = info->par;
+	struct gasket_coherent_buffer *coh = &af->gasket_dev->coherent_buffer;
+	struct apex_fb_layout lay;
+	unsigned long flags;
 	u32 cur;
 
 	switch (cmd) {
 	case FBIO_WAITFORVSYNC:
 		/*
-		 * No real vsync. Repurposed: also push the current fb contents
-		 * to the coherent input region (userspace has finished writing
-		 * its input image), then block until the next result arrives.
+		 * No real vsync. Repurposed: push the current fb contents to
+		 * the coherent input region (userspace has finished writing its
+		 * input image), then block until the next result arrives.
 		 */
 		apex_fbdev_push_input(af);
 		cur = READ_ONCE(af->result_seq);
 		return wait_event_interruptible(af->wait,
 					READ_ONCE(af->result_seq) != cur);
+
+	case APEX_FBIO_SET_LAYOUT:
+		if (copy_from_user(&lay, (void __user *)arg, sizeof(lay)))
+			return -EFAULT;
+		/*
+		 * Validate both windows lie fully within the coherent buffer.
+		 * The kernel does not interpret the contents; it only ensures
+		 * the copies it will perform stay in bounds.
+		 */
+		if (coh->length_bytes) {
+			if ((u64)lay.in_offset + lay.in_len > coh->length_bytes)
+				return -EINVAL;
+			if ((u64)lay.out_offset + lay.out_len > coh->length_bytes)
+				return -EINVAL;
+		}
+		spin_lock_irqsave(&af->lock, flags);
+		af->in_offset = lay.in_offset;
+		af->in_len = lay.in_len;
+		af->out_offset = lay.out_offset;
+		af->out_len = lay.out_len;
+		spin_unlock_irqrestore(&af->lock, flags);
+		return 0;
+
+	case APEX_FBIO_GET_LAYOUT:
+		spin_lock_irqsave(&af->lock, flags);
+		lay.in_offset = af->in_offset;
+		lay.in_len = af->in_len;
+		lay.out_offset = af->out_offset;
+		lay.out_len = af->out_len;
+		spin_unlock_irqrestore(&af->lock, flags);
+		if (copy_to_user((void __user *)arg, &lay, sizeof(lay)))
+			return -EFAULT;
+		return 0;
+
 	default:
 		return -ENOTTY;
 	}
@@ -255,6 +333,26 @@ int apex_fbdev_init(struct gasket_dev *gasket_dev)
 	af->info = info;
 	spin_lock_init(&af->lock);
 	init_waitqueue_head(&af->wait);
+
+	/*
+	 * Default coherent layout: split into a lower input half and an upper
+	 * output half so the two never overlap even before userspace calls
+	 * APEX_FBIO_SET_LAYOUT. The coherent buffer is allocated lazily (via
+	 * the config-coherent-allocator ioctl), so length_bytes is typically 0
+	 * here; base the default on the maximum coherent size instead. Every
+	 * copy is independently bounds-checked against the live length_bytes,
+	 * so an eventual smaller allocation stays safe. Userspace should set
+	 * the real per-model offsets/lengths at model-load time.
+	 */
+	{
+		u32 max_coh = (u32)(MAX_NUM_COHERENT_PAGES * PAGE_SIZE);
+		u32 half = max_coh / 2;
+
+		af->in_offset = 0;
+		af->in_len = half;
+		af->out_offset = half;
+		af->out_len = max_coh - half;
+	}
 
 	/* Default geometry -> buffer size. */
 	size = (size_t)APEX_FB_DEF_W * APEX_FB_DEF_H * 4;
