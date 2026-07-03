@@ -321,6 +321,12 @@ struct gasket_dev {
 	 * NULL when no sound card is registered for this device.
 	 */
 	void *alsa_priv;
+
+	/*
+	 * Opaque pointer for the optional fbdev front-end (apex_fbdev.c).
+	 * NULL when no framebuffer is registered for this device.
+	 */
+	void *fbdev_priv;
 };
 
 /* Type of the ioctl handler callback. */
