@@ -67,6 +67,15 @@ struct gasket_interrupt_data {
 	/* The number of times each interrupt has been called. */
 	ulong *interrupt_counts;
 
+	/*
+	 * Optional in-kernel callbacks, invoked from the ISR in addition to
+	 * eventfd signalling. One slot per interrupt index. Protected by
+	 * cb_lock. See gasket_interrupt_register_callback().
+	 */
+	gasket_interrupt_cb_t *callbacks;
+	void **callback_data;
+	rwlock_t cb_lock;
+
 	/* Linux IRQ number. */
 	int irq;
 };
@@ -165,8 +174,48 @@ gasket_handle_interrupt(struct gasket_interrupt_data *interrupt_data,
                 #endif
         read_unlock(&interrupt_data->eventfd_ctx_lock);
 
+	/*
+	 * Invoke any in-kernel callback registered for this interrupt. This
+	 * runs in addition to (and independently of) the eventfd signalling
+	 * above, so existing userspace consumers are unaffected.
+	 */
+	if (interrupt_data->callbacks) {
+		gasket_interrupt_cb_t cb;
+		void *cb_data;
+
+		read_lock(&interrupt_data->cb_lock);
+		cb = interrupt_data->callbacks[interrupt_index];
+		cb_data = interrupt_data->callback_data[interrupt_index];
+		read_unlock(&interrupt_data->cb_lock);
+		if (cb)
+			cb(cb_data, interrupt_index);
+	}
+
 	++(interrupt_data->interrupt_counts[interrupt_index]);
 }
+
+int gasket_interrupt_register_callback(struct gasket_dev *gasket_dev,
+				       int interrupt_index,
+				       gasket_interrupt_cb_t cb,
+				       void *cb_data)
+{
+	struct gasket_interrupt_data *interrupt_data =
+		gasket_dev->interrupt_data;
+	unsigned long flags;
+
+	if (!interrupt_data || !interrupt_data->callbacks)
+		return -EINVAL;
+	if (interrupt_index < 0 ||
+	    interrupt_index >= interrupt_data->num_interrupts)
+		return -EINVAL;
+
+	write_lock_irqsave(&interrupt_data->cb_lock, flags);
+	interrupt_data->callbacks[interrupt_index] = cb;
+	interrupt_data->callback_data[interrupt_index] = cb_data;
+	write_unlock_irqrestore(&interrupt_data->cb_lock, flags);
+	return 0;
+}
+EXPORT_SYMBOL(gasket_interrupt_register_callback);
 
 static irqreturn_t gasket_msix_interrupt_handler(int irq, void *dev_id)
 {
@@ -365,7 +414,29 @@ int gasket_interrupt_init(struct gasket_dev *gasket_dev)
 		return -ENOMEM;
 	}
 
+	interrupt_data->callbacks = kcalloc(driver_desc->num_interrupts,
+					    sizeof(gasket_interrupt_cb_t),
+					    GFP_KERNEL);
+	if (!interrupt_data->callbacks) {
+		kfree(interrupt_data->interrupt_counts);
+		kfree(interrupt_data->eventfd_ctxs);
+		kfree(interrupt_data);
+		return -ENOMEM;
+	}
+
+	interrupt_data->callback_data = kcalloc(driver_desc->num_interrupts,
+						sizeof(void *),
+						GFP_KERNEL);
+	if (!interrupt_data->callback_data) {
+		kfree(interrupt_data->callbacks);
+		kfree(interrupt_data->interrupt_counts);
+		kfree(interrupt_data->eventfd_ctxs);
+		kfree(interrupt_data);
+		return -ENOMEM;
+	}
+
 	rwlock_init(&interrupt_data->eventfd_ctx_lock);
+	rwlock_init(&interrupt_data->cb_lock);
 
 	switch (interrupt_data->type) {
 	case PCI_MSIX:
@@ -496,6 +567,8 @@ void gasket_interrupt_cleanup(struct gasket_dev *gasket_dev)
 		break;
 	}
 
+	kfree(interrupt_data->callback_data);
+	kfree(interrupt_data->callbacks);
 	kfree(interrupt_data->interrupt_counts);
 	kfree(interrupt_data->eventfd_ctxs);
 	kfree(interrupt_data);

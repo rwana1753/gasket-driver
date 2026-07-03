@@ -309,6 +309,12 @@ struct gasket_dev {
 	/* Unused until Accel is upstreamed. */
 	struct hlist_node hlist_node;
 	struct hlist_node legacy_hlist_node;
+
+	/*
+	 * Opaque pointer for the optional V4L2 front-end (apex_v4l2.c).
+	 * NULL when no video node is registered for this device.
+	 */
+	void *v4l2_priv;
 };
 
 /* Type of the ioctl handler callback. */

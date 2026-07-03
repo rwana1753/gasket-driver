@@ -13,10 +13,16 @@ config STAGING_GASKET_FRAMEWORK
 config STAGING_APEX_DRIVER
 	tristate "Apex Driver"
 	depends on STAGING_GASKET_FRAMEWORK
+	depends on VIDEO_DEV
+	select VIDEOBUF2_CORE
+	select VIDEOBUF2_DMA_CONTIG
 	help
 	  This driver supports the Apex Edge TPU device.  See
 	  https://cloud.google.com/edge-tpu/ for more information.
 	  Say Y if you want to include this driver in the kernel.
+
+	  It also registers a V4L2 capture node (/dev/videoN) for userspace
+	  that requires a V4L2 device to drive the accelerator output path.
 
 	  To compile this driver as a module, choose M here.  The module
 	  will be called "apex".

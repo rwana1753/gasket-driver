@@ -22,6 +22,7 @@
 
 #include "apex.h"
 
+#include "apex_v4l2.h"
 #include "gasket_core.h"
 #include "gasket_interrupt.h"
 #include "gasket_page_table.h"
@@ -1087,6 +1088,17 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 		goto remove_device;
 	}
 
+	/*
+	 * Register the optional V4L2 front-end. Failure is non-fatal: the
+	 * device still works through its native character-device interface.
+	 */
+	ret = apex_v4l2_init(gasket_dev);
+	if (ret)
+		dev_warn(&pci_dev->dev,
+			 "V4L2 node not created (%d); continuing without it\n",
+			 ret);
+	ret = 0;
+
 	/* Place device in low power mode until opened */
 	if (allow_power_save)
 		apex_enter_reset(gasket_dev);
@@ -1115,6 +1127,8 @@ static void apex_pci_remove(struct pci_dev *pci_dev)
 		goto remove_device;
 	}
 	gasket_dev = apex_dev->gasket_dev_ptr;
+
+	apex_v4l2_cleanup(gasket_dev);
 
 	cancel_delayed_work_sync(&apex_dev->check_temperature_work);
 	kfree(apex_dev);

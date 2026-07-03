@@ -105,4 +105,27 @@ int gasket_interrupt_clear_eventfd(struct gasket_interrupt_data *interrupt_data,
 
 int gasket_interrupt_system_status(struct gasket_dev *gasket_dev);
 
+/*
+ * In-kernel interrupt callback support (coexists with eventfd delivery).
+ *
+ * A driver (e.g. the V4L2 layer) may register a callback that is invoked
+ * from the MSI-X interrupt handler in addition to any eventfd signalling
+ * that is already configured for the same interrupt index. This lets the
+ * existing userspace eventfd contract remain intact while the kernel also
+ * reacts to the same interrupt.
+ *
+ * The callback runs in hard-IRQ context: keep it short and defer heavy work.
+ */
+typedef void (*gasket_interrupt_cb_t)(void *cb_data, int interrupt_index);
+
+/*
+ * Register an in-kernel callback for @interrupt_index.
+ * Pass cb == NULL to clear a previously registered callback.
+ * Returns 0 on success, -EINVAL on a bad index.
+ */
+int gasket_interrupt_register_callback(struct gasket_dev *gasket_dev,
+				       int interrupt_index,
+				       gasket_interrupt_cb_t cb,
+				       void *cb_data);
+
 #endif
