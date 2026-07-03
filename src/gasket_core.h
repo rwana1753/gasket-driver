@@ -315,6 +315,12 @@ struct gasket_dev {
 	 * NULL when no video node is registered for this device.
 	 */
 	void *v4l2_priv;
+
+	/*
+	 * Opaque pointer for the optional ALSA front-end (apex_alsa.c).
+	 * NULL when no sound card is registered for this device.
+	 */
+	void *alsa_priv;
 };
 
 /* Type of the ioctl handler callback. */

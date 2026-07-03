@@ -23,6 +23,7 @@
 #include "apex.h"
 
 #include "apex_v4l2.h"
+#include "apex_alsa.h"
 #include "gasket_core.h"
 #include "gasket_interrupt.h"
 #include "gasket_page_table.h"
@@ -1097,6 +1098,13 @@ static int apex_pci_probe(struct pci_dev *pci_dev,
 		dev_warn(&pci_dev->dev,
 			 "V4L2 node not created (%d); continuing without it\n",
 			 ret);
+
+	/* Register the optional ALSA sound card. Also non-fatal. */
+	ret = apex_alsa_init(gasket_dev);
+	if (ret)
+		dev_warn(&pci_dev->dev,
+			 "ALSA card not created (%d); continuing without it\n",
+			 ret);
 	ret = 0;
 
 	/* Place device in low power mode until opened */
@@ -1128,6 +1136,7 @@ static void apex_pci_remove(struct pci_dev *pci_dev)
 	}
 	gasket_dev = apex_dev->gasket_dev_ptr;
 
+	apex_alsa_cleanup(gasket_dev);
 	apex_v4l2_cleanup(gasket_dev);
 
 	cancel_delayed_work_sync(&apex_dev->check_temperature_work);
