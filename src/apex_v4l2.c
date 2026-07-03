@@ -33,10 +33,40 @@
  */
 #define APEX_V4L2_DONE_INTERRUPT 3
 
-/* Format negotiation bounds. Width carries the byte length; height is 1. */
-#define APEX_V4L2_MIN_SIZE 1u
-#define APEX_V4L2_MAX_SIZE (16u * 1024u * 1024u) /* 16 MiB ceiling */
-#define APEX_V4L2_DEF_SIZE 4096u
+/*
+ * Format negotiation bounds. The node now negotiates real 2D pixel formats
+ * (width x height) so that image-output models (e.g. text-to-image) can be
+ * consumed directly by userspace image pipelines. The legacy 1D chunk mode is
+ * still expressible as GREY with height == 1.
+ */
+#define APEX_V4L2_DIM_MIN     1u
+#define APEX_V4L2_DIM_MAX     8192u
+#define APEX_V4L2_MAX_SIZE    (64u * 1024u * 1024u) /* 64 MiB ceiling */
+#define APEX_V4L2_DEF_WIDTH   4096u
+#define APEX_V4L2_DEF_HEIGHT  1u
+
+/* Supported pixel formats and their bytes-per-pixel. */
+struct apex_v4l2_fmt {
+	u32 fourcc;
+	u8 bpp; /* bytes per pixel */
+};
+
+static const struct apex_v4l2_fmt apex_v4l2_formats[] = {
+	{ V4L2_PIX_FMT_RGB24, 3 },
+	{ V4L2_PIX_FMT_BGR24, 3 },
+	{ V4L2_PIX_FMT_RGBA32, 4 },
+	{ V4L2_PIX_FMT_GREY, 1 },
+};
+
+static const struct apex_v4l2_fmt *apex_find_fmt(u32 fourcc)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(apex_v4l2_formats); i++)
+		if (apex_v4l2_formats[i].fourcc == fourcc)
+			return &apex_v4l2_formats[i];
+	return NULL;
+}
 
 struct apex_v4l2_buffer {
 	struct vb2_v4l2_buffer vb;
@@ -57,7 +87,11 @@ struct apex_v4l2 {
 	spinlock_t irq_lock;
 	struct list_head buf_list;
 
-	/* Negotiated frame length in bytes (sizeimage). */
+	/* Negotiated format. sizeimage == height * bytesperline. */
+	u32 fourcc;
+	u32 width;
+	u32 height;
+	u32 bytesperline;
 	u32 sizeimage;
 
 	bool streaming;
@@ -265,21 +299,22 @@ static void apex_fill_fmt(struct apex_v4l2 *av, struct v4l2_format *f)
 	struct v4l2_pix_format *pix = &f->fmt.pix;
 
 	memset(pix, 0, sizeof(*pix));
-	pix->pixelformat = V4L2_PIX_FMT_GREY; /* generic 8-bit container */
-	pix->width = av->sizeimage;
-	pix->height = 1;
+	pix->pixelformat = av->fourcc;
+	pix->width = av->width;
+	pix->height = av->height;
 	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = av->sizeimage;
+	pix->bytesperline = av->bytesperline;
 	pix->sizeimage = av->sizeimage;
-	pix->colorspace = V4L2_COLORSPACE_RAW;
+	pix->colorspace = (av->fourcc == V4L2_PIX_FMT_GREY) ?
+		V4L2_COLORSPACE_RAW : V4L2_COLORSPACE_SRGB;
 }
 
 static int apex_enum_fmt(struct file *file, void *priv,
 			 struct v4l2_fmtdesc *f)
 {
-	if (f->index != 0)
+	if (f->index >= ARRAY_SIZE(apex_v4l2_formats))
 		return -EINVAL;
-	f->pixelformat = V4L2_PIX_FMT_GREY;
+	f->pixelformat = apex_v4l2_formats[f->index].fourcc;
 	return 0;
 }
 
@@ -291,35 +326,47 @@ static int apex_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 	return 0;
 }
 
-static u32 apex_clamp_size(u32 size)
+static inline u32 apex_clamp_dim(u32 v)
 {
-	if (size < APEX_V4L2_MIN_SIZE)
-		size = APEX_V4L2_MIN_SIZE;
-	if (size > APEX_V4L2_MAX_SIZE)
-		size = APEX_V4L2_MAX_SIZE;
-	return size;
+	if (v < APEX_V4L2_DIM_MIN)
+		v = APEX_V4L2_DIM_MIN;
+	if (v > APEX_V4L2_DIM_MAX)
+		v = APEX_V4L2_DIM_MAX;
+	return v;
 }
 
 static int apex_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct v4l2_pix_format *pix = &f->fmt.pix;
-	u32 size;
+	const struct apex_v4l2_fmt *fmt;
+	u32 width, height, bpl, sizeimage;
 
-	/*
-	 * Userspace picks the frame byte length via width (or sizeimage if it
-	 * sets that instead). Height is always 1; the buffer is opaque bytes.
-	 */
-	size = pix->sizeimage ? pix->sizeimage : pix->width;
-	size = apex_clamp_size(size);
+	/* Fall back to a supported format if userspace requested an unknown one. */
+	fmt = apex_find_fmt(pix->pixelformat);
+	if (!fmt)
+		fmt = &apex_v4l2_formats[0]; /* RGB24 */
+
+	width = apex_clamp_dim(pix->width);
+	height = apex_clamp_dim(pix->height);
+
+	bpl = width * fmt->bpp;
+	sizeimage = bpl * height;
+
+	/* Enforce the overall ceiling by shrinking height if necessary. */
+	if (sizeimage > APEX_V4L2_MAX_SIZE) {
+		height = max_t(u32, 1u, APEX_V4L2_MAX_SIZE / bpl);
+		sizeimage = bpl * height;
+	}
 
 	memset(pix, 0, sizeof(*pix));
-	pix->pixelformat = V4L2_PIX_FMT_GREY;
-	pix->width = size;
-	pix->height = 1;
+	pix->pixelformat = fmt->fourcc;
+	pix->width = width;
+	pix->height = height;
 	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = size;
-	pix->sizeimage = size;
-	pix->colorspace = V4L2_COLORSPACE_RAW;
+	pix->bytesperline = bpl;
+	pix->sizeimage = sizeimage;
+	pix->colorspace = (fmt->fourcc == V4L2_PIX_FMT_GREY) ?
+		V4L2_COLORSPACE_RAW : V4L2_COLORSPACE_SRGB;
 	return 0;
 }
 
@@ -335,6 +382,10 @@ static int apex_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 	if (ret)
 		return ret;
 
+	av->fourcc = f->fmt.pix.pixelformat;
+	av->width = f->fmt.pix.width;
+	av->height = f->fmt.pix.height;
+	av->bytesperline = f->fmt.pix.bytesperline;
 	av->sizeimage = f->fmt.pix.sizeimage;
 	return 0;
 }
@@ -412,7 +463,12 @@ int apex_v4l2_init(struct gasket_dev *gasket_dev)
 		return -ENOMEM;
 
 	av->gasket_dev = gasket_dev;
-	av->sizeimage = APEX_V4L2_DEF_SIZE;
+	/* Default format: RGB24 at the legacy 1-row chunk width. */
+	av->fourcc = V4L2_PIX_FMT_RGB24;
+	av->width = APEX_V4L2_DEF_WIDTH;
+	av->height = APEX_V4L2_DEF_HEIGHT;
+	av->bytesperline = APEX_V4L2_DEF_WIDTH * 3;
+	av->sizeimage = av->bytesperline * APEX_V4L2_DEF_HEIGHT;
 	mutex_init(&av->lock);
 	spin_lock_init(&av->irq_lock);
 	INIT_LIST_HEAD(&av->buf_list);
